@@ -7,10 +7,14 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 	"io"
-	"log"
 	"os"
 	"os/exec"
+	"strings"
+	"sync"
+	"time"
 )
+
+var diagnostics *tview.TextView
 
 // JSON-RPC request structure
 type Request struct {
@@ -20,24 +24,60 @@ type Request struct {
 	Params  interface{} `json:"params,omitempty"`
 }
 
-func main() {
-	// Start the gopls process
-	cmd := exec.Command("gopls")
-	cmd.Dir = "./testdata"
-	stdin, err := cmd.StdinPipe()
+var logfile *os.File
+var logOpen sync.Once
+
+func logf(format string, args ...interface{}) {
+	logOpen.Do(func() {
+		var err error
+		logfile, err = os.OpenFile("goedit.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			panic(err)
+		}
+	})
+	format = strings.TrimSpace(format)
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	_, err := logfile.WriteString(fmt.Sprintf("%s %s \n", timestamp, fmt.Sprintf(format, args...)))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating stdin pipe: %v\n", err)
-		return
+		panic(err)
 	}
+}
+
+func main() {
+
+	logf("Starting goedit")
+	// Start the gopls process
+	cmd := exec.Command("/opt/homebrew/bin/gopls", "-rpc.trace", "-logfile", "gopls.log")
+
+	//output, err2 := cmd.CombinedOutput()
+	//if err2 != nil {
+	//	logf("Error starting gopls: %v", err2)
+	//	return
+	//}
+	//logf("gopls output: %s", output)
+	//time.Sleep(20 * time.Second)
+	//stdin, err := cmd.StdinPipe()
+	//if err != nil {
+	//	logf("Error creating stdin pipe: %v", err)
+	//	return
+	//}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating stdout pipe: %v\n", err)
+		logf("Error creating stdout pipe: %v", err)
+		return
+	}
+
+	errPipe, err := cmd.StderrPipe()
+	if err != nil {
+		logf("Error creating stderr pipe: %v", err)
 		return
 	}
 
 	// Start the gopls process
+	logf("Starting gopls")
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error starting gopls: %v\n", err)
+		logf("Error starting gopls: %v", err)
 		return
 	}
 
@@ -53,14 +93,19 @@ func main() {
 	// load testdata/testprogram.go into a string
 	fileContentBytes, err := os.ReadFile("testdata/testprogram.go")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading testprogram.go: %v\n", err)
+		logf("Error reading testprogram.go: %v", err)
 		return
 	}
 	fileContent := string(fileContentBytes)
 
 	editor.SetText(fileContent) // Set the initial content of the editor
 	// Create a Flex Layout to organize the editor and diagnostics pane
-	diagnostics := tview.NewTextView().
+	editor.SetMouseCapture(func(action tview.MouseAction, event *tcell.EventMouse) (tview.MouseAction, *tcell.EventMouse) {
+		//fmt.Fprintf(os.Stderr, "Mouse action: %v, Mouse event: %v\n", action, event)
+		return action, event
+	})
+
+	diagnostics = tview.NewTextView().
 		SetText("[red]Diagnostics will appear here.[white]").
 		SetDynamicColors(true)
 	flex := tview.NewFlex().
@@ -70,6 +115,8 @@ func main() {
 
 	// Handle key events (e.g., simulate saving or other commands)
 	editor.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		//editor.SetText(fmt.Sprintf("Key pressed: %q (ASCII: %d) %+v", event.Rune(), event.Key(), event))
+
 		switch event.Key() {
 		case tcell.KeyCtrlS: // Ctrl+S saves the file
 			//log.Println("File saved!") // Replace with actual save logic
@@ -79,6 +126,34 @@ func main() {
 		return event // Pass the key event back to the editor
 	})
 
+	logf("starting pipe listeners")
+	// Start listening to gopls' output
+	go func() {
+		defer logf("Stopped listening to gopls")
+		listenToGopls(stdout, diagnostics)
+		cmd.Wait()
+		logf("gopls state %s", cmd.ProcessState.String())
+	}()
+
+	go func() {
+		defer logf("Stopped listening err gopls")
+		listenForErrors(errPipe, diagnostics)
+	}()
+
+	//if err := sendInitializationRequest(stdin); err != nil {
+	//	logf("Error sending initialization request: %v", err)
+	//	return
+	//}
+
+	// Set up the application and run it
+	if err := app.SetRoot(flex, true).Run(); err != nil {
+		app.Stop()
+		logf("booom! %+v", err)
+		panic(err)
+	}
+}
+
+func sendInitializationRequest(stdin io.Writer) error {
 	// Example: Send Initialization Request
 	initRequest := Request{
 		JsonRPC: "2.0",
@@ -100,33 +175,25 @@ func main() {
 	// Marshal the request into JSON
 	data, err := json.Marshal(initRequest)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error marshaling request: %v\n", err)
-		return
+		logf("Error marshaling request: %v", err)
+		return err
 	}
 
 	// Send the request
 	_, err = stdin.Write(data)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing to stdin: %v\n", err)
-		return
+		logf("Error writing to stdin: %v", err)
+		return err
 	}
-	stdin.Write([]byte("\n"))                           // JSON-RPC must end with a newline
+	stdin.Write([]byte("\n")) // JSON-RPC must end with a newline
+	logf("Sent initialization request")
+
 	err = sendDidOpen(stdin, "testdata/testprogram.go") // Notify gopls that we opened a file
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error sending didOpen notification: %v\n", err)
-		return
+		logf("Error sending didOpen notification: %v", err)
+		return err
 	}
-	// Start listening to gopls' output
-	go func() {
-		listenToGopls(stdout, diagnostics)
-	}()
-
-	// Set up the application and run it
-	if err := app.SetRoot(flex, true).Run(); err != nil {
-		app.Stop()
-		log.Fatalf("booom! %+v", err)
-		//panic(err)
-	}
+	return nil
 }
 
 // Open a file and notify gopls about it
@@ -163,16 +230,30 @@ func sendDidOpen(stdinWriter io.Writer, filePath string) error {
 	_, err = stdinWriter.Write([]byte("\n")) // JSON-RPC messages end with a newline
 	return err
 }
+func listenForErrors(errPipe io.ReadCloser, diagnostics *tview.TextView) {
+	scanner := bufio.NewScanner(errPipe)
+	for scanner.Scan() {
+		logf("scanned error %s", scanner.Text())
+	}
+	if scanner.Err() != nil {
+		logf("Error reading from gopls: %v", scanner.Err())
+	} else {
+		logf("done scanning gopls")
+	}
+}
+
 func listenToGopls(stdout io.ReadCloser, diagnostics *tview.TextView) {
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
+		logf("scanned something %s", scanner.Text())
+
 		var response map[string]interface{}
 		err := json.Unmarshal(scanner.Bytes(), &response)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing gopls response: %v\n", err)
+			logf("Error parsing gopls response: %v", err)
 			continue
 		}
-
+		diagnostics.SetText(fmt.Sprintf("%v", response))
 		// Check if it's a diagnostic notification
 		if response["method"] == "textDocument/publishDiagnostics" {
 			params := response["params"].(map[string]interface{})
@@ -185,6 +266,11 @@ func listenToGopls(stdout io.ReadCloser, diagnostics *tview.TextView) {
 				diagnostics.Write([]byte(message)) // Add each diagnostic message to the panel
 			}
 		}
+	}
+	if scanner.Err() != nil {
+		logf("Error reading from gopls: %v", scanner.Err())
+	} else {
+		logf("done scanning gopls")
 	}
 }
 
