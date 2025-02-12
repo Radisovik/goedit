@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"github.com/gdamore/tcell/v2"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -48,20 +50,13 @@ func main() {
 
 	logf("Starting goedit")
 	// Start the gopls process
-	cmd := exec.Command("/opt/homebrew/bin/gopls", "-rpc.trace", "-logfile", "gopls.log")
+	cmd := exec.Command("/opt/homebrew/bin/gopls", "-vv", "-rpc.trace", "-logfile", "gopls.log")
 
-	//output, err2 := cmd.CombinedOutput()
-	//if err2 != nil {
-	//	logf("Error starting gopls: %v", err2)
-	//	return
-	//}
-	//logf("gopls output: %s", output)
-	//time.Sleep(20 * time.Second)
-	//stdin, err := cmd.StdinPipe()
-	//if err != nil {
-	//	logf("Error creating stdin pipe: %v", err)
-	//	return
-	//}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		logf("Error creating stdin pipe: %v", err)
+		return
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		logf("Error creating stdout pipe: %v", err)
@@ -140,10 +135,15 @@ func main() {
 		listenForErrors(errPipe, diagnostics)
 	}()
 
-	//if err := sendInitializationRequest(stdin); err != nil {
-	//	logf("Error sending initialization request: %v", err)
-	//	return
-	//}
+	if err := sendInitializationRequest(stdin); err != nil {
+		logf("Error sending initialization request: %v", err)
+		return
+	}
+
+	if err := sendDidOpen(stdin, "testdata/testprogram.go"); err != nil {
+		logf("Error sending initialization request: %v", err)
+		return
+	}
 
 	// Set up the application and run it
 	if err := app.SetRoot(flex, true).Run(); err != nil {
@@ -172,25 +172,21 @@ func sendInitializationRequest(stdin io.Writer) error {
 		},
 	}
 
+	return send(stdin, initRequest)
+}
+
+func send(stdin io.Writer, request Request) error {
 	// Marshal the request into JSON
-	data, err := json.Marshal(initRequest)
+	data, err := json.Marshal(request)
 	if err != nil {
-		logf("Error marshaling request: %v", err)
 		return err
 	}
 
-	// Send the request
-	_, err = stdin.Write(data)
+	fullRequest := fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(data), data)
+
+	_, err = stdin.Write([]byte(fullRequest))
 	if err != nil {
 		logf("Error writing to stdin: %v", err)
-		return err
-	}
-	stdin.Write([]byte("\n")) // JSON-RPC must end with a newline
-	logf("Sent initialization request")
-
-	err = sendDidOpen(stdin, "testdata/testprogram.go") // Notify gopls that we opened a file
-	if err != nil {
-		logf("Error sending didOpen notification: %v", err)
 		return err
 	}
 	return nil
@@ -203,32 +199,28 @@ func sendDidOpen(stdinWriter io.Writer, filePath string) error {
 		return fmt.Errorf("failed to read file: %v", err)
 	}
 
+	//var joe TextDocumentItem
+
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %v", err)
+	}
+
+	uri := "file://" + absPath
 	request := Request{
 		JsonRPC: "2.0",
 		ID:      2,
 		Method:  "textDocument/didOpen",
 		Params: map[string]interface{}{
 			"textDocument": map[string]interface{}{
-				"uri":        "file://" + filePath,
+				"uri":        uri,
 				"languageId": "go",
 				"version":    1,
 				"text":       string(content),
 			},
 		},
 	}
-
-	data, err := json.Marshal(request)
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %v", err)
-	}
-
-	_, err = stdinWriter.Write(data)
-	if err != nil {
-		return fmt.Errorf("error writing to stdin: %v", err)
-	}
-
-	_, err = stdinWriter.Write([]byte("\n")) // JSON-RPC messages end with a newline
-	return err
+	return send(stdinWriter, request)
 }
 func listenForErrors(errPipe io.ReadCloser, diagnostics *tview.TextView) {
 	scanner := bufio.NewScanner(errPipe)
@@ -243,34 +235,82 @@ func listenForErrors(errPipe io.ReadCloser, diagnostics *tview.TextView) {
 }
 
 func listenToGopls(stdout io.ReadCloser, diagnostics *tview.TextView) {
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		logf("scanned something %s", scanner.Text())
 
-		var response map[string]interface{}
-		err := json.Unmarshal(scanner.Bytes(), &response)
+	var contentLength int
+	var lineBuffer bytes.Buffer
+	for {
+		// Read byte by byte to construct each line
+		b := make([]byte, 1)
+		_, err := stdout.Read(b)
 		if err != nil {
-			logf("Error parsing gopls response: %v", err)
-			continue
+			logf("Error reading from stdout: %v", err)
+			return
 		}
-		diagnostics.SetText(fmt.Sprintf("%v", response))
-		// Check if it's a diagnostic notification
-		if response["method"] == "textDocument/publishDiagnostics" {
-			params := response["params"].(map[string]interface{})
-
-			// Display diagnostics in the diagnostics pane
-			diagnostics.Clear() // Clear the panel before adding new diagnostics
-			for _, diag := range params["diagnostics"].([]interface{}) {
-				diagnostic := diag.(map[string]interface{})
-				message := fmt.Sprintf("- %s (line %v)\n", diagnostic["message"], diagnostic["range"])
-				diagnostics.Write([]byte(message)) // Add each diagnostic message to the panel
+		if b[0] == '\n' {
+			line := lineBuffer.String()
+			lineBuffer.Reset()
+			if line == "" { // Break on the empty line separating headers from the body
+				break
 			}
+			if strings.HasPrefix(line, "Content-Length:") {
+				fmt.Sscanf(line, "Content-Length: %d", &contentLength)
+				break
+			}
+		} else {
+			lineBuffer.WriteByte(b[0])
 		}
 	}
-	if scanner.Err() != nil {
-		logf("Error reading from gopls: %v", scanner.Err())
-	} else {
-		logf("done scanning gopls")
+
+	// If Content-Length is not found or reading fails, log the error
+	if contentLength == 0 {
+		logf("Invalid Content-Length or error reading headers")
+		return
+	}
+
+	contentLength += 2 // Add 2 bytes for the newline characters and the JSON-RPC response
+	// Allocate a buffer to read the response body of the specified size
+	buffer := make([]byte, contentLength)
+	n, err := io.ReadFull(stdout, buffer)
+	if err != nil {
+		logf("Error reading response body: %v", err)
+		return
+	}
+	if n != contentLength {
+		logf("Invalid response body size: expected %d, got %d", contentLength, n)
+		panic("Invalid response body size")
+	}
+
+	// Parse the JSON-RPC response
+	var response map[string]interface{}
+	err = json.Unmarshal(buffer, &response)
+	if err != nil {
+		logf("Error parsing JSON-RPC response: %v", err)
+		panic(err)
+	}
+
+	logf("Response received: %+v", response)
+
+	// Check if it's a diagnostic notification and handle accordingly
+	if response["method"] == "textDocument/publishDiagnostics" {
+		params, ok := response["params"].(map[string]interface{})
+		if !ok {
+			logf("Invalid diagnostic params format")
+			panic(err)
+		}
+
+		// Display diagnostics in the diagnostics pane
+		//diagnostics.Clear() // Clear the panel before adding new diagnostics
+		diagnosticItems, ok := params["diagnostics"].([]interface{})
+		if !ok {
+			logf("Invalid diagnostics format")
+			panic(err)
+		}
+
+		for _, diag := range diagnosticItems {
+			diagnostic := diag.(map[string]interface{})
+			message := fmt.Sprintf("- %s (line %v)\n", diagnostic["message"], diagnostic["range"])
+			diagnostics.Write([]byte(message)) // Write diagnostic message to the panel
+		}
 	}
 }
 
