@@ -40,10 +40,15 @@ func logf(format string, args ...interface{}) {
 	format = strings.TrimSpace(format)
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	_, err := logfile.WriteString(fmt.Sprintf("%s %s \n", timestamp, fmt.Sprintf(format, args...)))
+	msg := fmt.Sprintf("%s %s \n", timestamp, fmt.Sprintf(format, args...))
+	_, err := logfile.WriteString(msg)
 	if err != nil {
 		panic(err)
 	}
+	
+	if diagnostics != nil {
+	diagnostics.Write([]byte(msg))
+}
 }
 
 func main() {
@@ -101,8 +106,7 @@ func main() {
 	})
 
 	diagnostics = tview.NewTextView().
-		SetText("[red]Diagnostics will appear here.[white]").
-		SetDynamicColors(true)
+		SetDynamicColors(true).SetScrollable(true).SetWrap(true).SetWordWrap(true).SetLabel("logs ")
 	flex := tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(editor, 0, 1, true).      // Editor takes most space
@@ -140,10 +144,10 @@ func main() {
 		return
 	}
 
-	if err := sendDidOpen(stdin, "testdata/testprogram.go"); err != nil {
-		logf("Error sending initialization request: %v", err)
-		return
-	}
+	//if err := sendDidOpen(stdin, "testdata/testprogram.go"); err != nil {
+//		logf("Error sending initialization request: %v", err)
+//		return
+//	}
 
 	// Set up the application and run it
 	if err := app.SetRoot(flex, true).Run(); err != nil {
@@ -288,8 +292,7 @@ func listenToGopls(stdout io.ReadCloser, diagnostics *tview.TextView) {
 		panic(err)
 	}
 
-	logf("Response received: %+v", response)
-
+	logf("GOPLS: received: %+v", response)
 	// Check if it's a diagnostic notification and handle accordingly
 	if response["method"] == "textDocument/publishDiagnostics" {
 		params, ok := response["params"].(map[string]interface{})
