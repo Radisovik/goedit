@@ -157,6 +157,40 @@ func main() {
 	}
 }
 
+var gid = uint32(0)
+
+func [REQ, RESP] sendSync(method string, req REQ) (RESP, error) {
+	id := atomic.AddDelta(gid)	
+        r := Request {
+		JsonRPC: "2.0",
+		ID: id,
+		Method: method,
+		Parms: req
+        }
+	rslt := registerListener(id) 
+	//TODO: add a timeout here 
+        resp := <-rslt
+	var rtn RESP
+	err := json.Unmarshal(resp, &rtn)
+	if err != nil {
+		panic(err) 
+	}
+	return rtn,nil
+
+}
+
+func [REQ] sendAsync(method string, req REQ) {
+	id := atomic.AddDelta(gid)	
+        r := Request {
+		JsonRPC: "2.0",
+		ID: id,
+		Method: method,
+		Parms: req
+        }
+
+
+}
+
 func sendInitializationRequest(stdin io.Writer) error {
 	// Example: Send Initialization Request
 	initRequest := Request{
