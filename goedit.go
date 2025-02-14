@@ -7,23 +7,31 @@ import (
 	"fmt"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"github.com/sourcegraph/go-lsp"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var diagnostics *tview.TextView
 
 // JSON-RPC request structure
-type Request struct {
-	JsonRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Method  string      `json:"method"`
-	Params  interface{} `json:"params,omitempty"`
+type Request[T any] struct {
+	JsonRPC string `json:"jsonrpc"`
+	ID      int    `json:"id"`
+	Method  string `json:"method"`
+	Params  T      `json:"params,omitempty"`
+}
+
+type Response[T any] struct {
+	JsonRPC string `json:"jsonrpc"`
+	ID      int    `json:"id"`
+	Result  T      `json:"result,omitempty"`
 }
 
 var logfile *os.File
@@ -135,9 +143,11 @@ func main() {
 		listenForErrors(errPipe, diagnostics)
 	}()
 
-	if err := sendInitializationRequest(stdin); err != nil {
+	if resp, err := sendInitializationRequest(stdin); err != nil {
 		logf("Error sending initialization request: %v", err)
 		return
+	} else {
+		logf("Response received: %+v", resp)
 	}
 
 	if err := sendDidOpen(stdin, "testdata/testprogram.go"); err != nil {
@@ -153,29 +163,52 @@ func main() {
 	}
 }
 
-func sendInitializationRequest(stdin io.Writer) error {
-	// Example: Send Initialization Request
-	initRequest := Request{
-		JsonRPC: "2.0",
-		ID:      1,
-		Method:  "initialize",
-		Params: map[string]interface{}{
-			"processId": nil,
-			"rootUri":   "file://" + os.Getenv("PWD"),
-			"capabilities": map[string]interface{}{
-				"textDocument": map[string]interface{}{
-					"completion": map[string]bool{
-						"dynamicRegistration": false,
-					},
-				},
-			},
-		},
+func sendInitializationRequest(stdin io.Writer) (Response[lsp.InitializeResult], error) {
+	p := lsp.InitializeParams{
+		RootURI:               "",
+		ClientInfo:            lsp.ClientInfo{},
+		Trace:                 "",
+		InitializationOptions: nil,
+		Capabilities:          lsp.ClientCapabilities{},
+		WorkDoneToken:         "",
 	}
-
-	return send(stdin, initRequest)
+	rq := req[lsp.InitializeParams]("initialize", p)
+	return sendSync[lsp.InitializeParams, lsp.InitializeResult](stdin, rq)
 }
 
-func send(stdin io.Writer, request Request) error {
+var gid = int32(0)
+
+func req[REQ any](method string, p REQ) Request[REQ] {
+	id := atomic.AddInt32(&gid, 1)
+	return Request[REQ]{
+		JsonRPC: "2.0",
+		ID:      int(id),
+		Method:  method,
+		Params:  p,
+	}
+}
+
+func sendAsync[REQ any](stdin io.Writer, r Request[REQ]) error {
+	err := send(stdin, r)
+	return err
+}
+
+func sendSync[REQ any, RESP any](stdin io.Writer, r Request[REQ]) (Response[RESP], error) {
+	var rtn Response[RESP]
+	ch := make(chan []byte)
+	addOutstandingMethod(r.ID, ch)
+	defer removeOutstandingMethod(r.ID)
+	err := send(stdin, r)
+	if err != nil {
+		return rtn, err
+	}
+	//TOOD put a timeout here
+	data := <-ch
+	err = json.Unmarshal(data, &rtn)
+	return rtn, err
+}
+
+func send[R any](stdin io.Writer, request Request[R]) error {
 	// Marshal the request into JSON
 	data, err := json.Marshal(request)
 	if err != nil {
@@ -199,29 +232,26 @@ func sendDidOpen(stdinWriter io.Writer, filePath string) error {
 		return fmt.Errorf("failed to read file: %v", err)
 	}
 
-	//var joe TextDocumentItem
-
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to get absolute path: %v", err)
 	}
 
-	uri := "file://" + absPath
-	request := Request{
+	uri := lsp.DocumentURI("file://" + absPath)
+	request := Request[lsp.TextDocumentItem]{
 		JsonRPC: "2.0",
 		ID:      2,
 		Method:  "textDocument/didOpen",
-		Params: map[string]interface{}{
-			"textDocument": map[string]interface{}{
-				"uri":        uri,
-				"languageId": "go",
-				"version":    1,
-				"text":       string(content),
-			},
+		Params: lsp.TextDocumentItem{
+			URI:        uri,
+			LanguageID: "go",
+			Version:    1,
+			Text:       string(content),
 		},
 	}
-	return send(stdinWriter, request)
+	return sendAsync(stdinWriter, request)
 }
+
 func listenForErrors(errPipe io.ReadCloser, diagnostics *tview.TextView) {
 	scanner := bufio.NewScanner(errPipe)
 	for scanner.Scan() {
@@ -233,6 +263,21 @@ func listenForErrors(errPipe io.ReadCloser, diagnostics *tview.TextView) {
 		logf("done scanning gopls")
 	}
 }
+
+func addOutstandingMethod(id int, ch chan []byte) {
+	omlock.Lock()
+	defer omlock.Unlock()
+	outstandingMethods[id] = ch
+}
+
+func removeOutstandingMethod(id int) {
+	omlock.Lock()
+	defer omlock.Unlock()
+	delete(outstandingMethods, id)
+}
+
+var omlock = sync.Mutex{}
+var outstandingMethods = make(map[int]chan []byte)
 
 func listenToGopls(stdout io.ReadCloser, diagnostics *tview.TextView) {
 
@@ -280,125 +325,89 @@ func listenToGopls(stdout io.ReadCloser, diagnostics *tview.TextView) {
 		panic("Invalid response body size")
 	}
 
-	// Parse the JSON-RPC response
-	var response map[string]interface{}
-	err = json.Unmarshal(buffer, &response)
+	type jsonRpcResponse struct {
+		JsonRPC string `json:"jsonrpc"`
+		ID      int    `json:"id"`
+		Method  string `json:"method"`
+	}
+	var resp = jsonRpcResponse{}
+	err = json.Unmarshal(buffer, &resp)
 	if err != nil {
 		logf("Error parsing JSON-RPC response: %v", err)
 		panic(err)
 	}
-
-	logf("Response received: %+v", response)
-
-	// Check if it's a diagnostic notification and handle accordingly
-	if response["method"] == "textDocument/publishDiagnostics" {
-		params, ok := response["params"].(map[string]interface{})
-		if !ok {
-			logf("Invalid diagnostic params format")
-			panic(err)
-		}
-
-		// Display diagnostics in the diagnostics pane
-		//diagnostics.Clear() // Clear the panel before adding new diagnostics
-		diagnosticItems, ok := params["diagnostics"].([]interface{})
-		if !ok {
-			logf("Invalid diagnostics format")
-			panic(err)
-		}
-
-		for _, diag := range diagnosticItems {
-			diagnostic := diag.(map[string]interface{})
-			message := fmt.Sprintf("- %s (line %v)\n", diagnostic["message"], diagnostic["range"])
-			diagnostics.Write([]byte(message)) // Write diagnostic message to the panel
-		}
+	omlock.Lock()
+	if listener, ok := outstandingMethods[resp.ID]; ok {
+		listener <- buffer
+	} else {
+		logf("No listener for %d", resp.ID)
 	}
+	omlock.Unlock()
+
+	//// Parse the JSON-RPC response
+	//var response map[string]interface{}
+	//err = json.Unmarshal(buffer, &response)
+	//if err != nil {
+	//	logf("Error parsing JSON-RPC response: %v", err)
+	//	panic(err)
+	//}
+	//
+	//logf("Response received: %+v", response)
+	//
+	//// Check if it's a diagnostic notification and handle accordingly
+	//if response["method"] == "textDocument/publishDiagnostics" {
+	//	params, ok := response["params"].(map[string]interface{})
+	//	if !ok {
+	//		logf("Invalid diagnostic params format")
+	//		panic(err)
+	//	}
+	//
+	//	// Display diagnostics in the diagnostics pane
+	//	//diagnostics.Clear() // Clear the panel before adding new diagnostics
+	//	diagnosticItems, ok := params["diagnostics"].([]interface{})
+	//	if !ok {
+	//		logf("Invalid diagnostics format")
+	//		panic(err)
+	//	}
+	//
+	//	for _, diag := range diagnosticItems {
+	//		diagnostic := diag.(map[string]interface{})
+	//		message := fmt.Sprintf("- %s (line %v)\n", diagnostic["message"], diagnostic["range"])
+	//		diagnostics.Write([]byte(message)) // Write diagnostic message to the panel
+	//	}
+	//}
 }
 
-func sendCompletionRequest(stdinWriter *os.File, uri string, line, character int) error {
-	request := Request{
-		JsonRPC: "2.0",
-		ID:      3,
-		Method:  "textDocument/completion",
-		Params: map[string]interface{}{
-			"textDocument": map[string]interface{}{
-				"uri": uri,
+func sendCompletionRequest(stdin io.Writer, uri string, line, character int) (Response[lsp.CompletionList], error) {
+	r := lsp.CompletionParams{
+		TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+			TextDocument: lsp.TextDocumentIdentifier{
+				URI: lsp.DocumentURI(uri),
 			},
-			"position": map[string]int{
-				"line":      line,
-				"character": character,
+			Position: lsp.Position{
+				Line:      line,
+				Character: character,
 			},
 		},
+		Context: lsp.CompletionContext{
+			TriggerKind:      lsp.CTKInvoked,
+			TriggerCharacter: "",
+		},
 	}
-
-	data, err := json.Marshal(request)
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %v", err)
-	}
-
-	_, err = stdinWriter.Write(data)
-	if err != nil {
-		return fmt.Errorf("error writing to stdin: %v", err)
-	}
-	_, err = stdinWriter.Write([]byte("\n"))
-	return err
+	rq := req[lsp.CompletionParams]("textDocument/completion", r)
+	return sendSync[lsp.CompletionParams, lsp.CompletionList](stdin, rq)
 }
 
-func sendFormattingRequest(stdinWriter *os.File, uri string) error {
-	request := Request{
-		JsonRPC: "2.0",
-		ID:      4,
-		Method:  "textDocument/formatting",
-		Params: map[string]interface{}{
-			"textDocument": map[string]interface{}{
-				"uri": uri,
-			},
-			"options": map[string]interface{}{
-				"tabSize":      2,
-				"insertSpaces": true,
-			},
+func sendFormattingRequest(stdin io.Writer, uri string) error {
+	p := lsp.DocumentFormattingParams{
+		TextDocument: lsp.TextDocumentIdentifier{
+			URI: lsp.DocumentURI(uri),
+		},
+		Options: lsp.FormattingOptions{
+			TabSize:      2,
+			InsertSpaces: true,
 		},
 	}
-
-	data, err := json.Marshal(request)
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %v", err)
-	}
-
-	_, err = stdinWriter.Write(data)
-	if err != nil {
-		return fmt.Errorf("error writing to stdin: %v", err)
-	}
-
-	_, err = stdinWriter.Write([]byte("\n"))
-	return err
-}
-
-func sendDefinitionRequest(stdinWriter *os.File, uri string, line, character int) error {
-	request := Request{
-		JsonRPC: "2.0",
-		ID:      5,
-		Method:  "textDocument/definition",
-		Params: map[string]interface{}{
-			"textDocument": map[string]interface{}{
-				"uri": uri,
-			},
-			"position": map[string]int{
-				"line":      line,
-				"character": character,
-			},
-		},
-	}
-
-	data, err := json.Marshal(request)
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %v", err)
-	}
-
-	_, err = stdinWriter.Write(data)
-	if err != nil {
-		return fmt.Errorf("error writing to stdin: %v", err)
-	}
-
-	_, err = stdinWriter.Write([]byte("\n"))
-	return err
+	r := req[lsp.DocumentFormattingParams]("textDocument/formatting", p)
+	return sendAsync(stdin, r)
 }
