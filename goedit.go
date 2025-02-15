@@ -20,7 +20,7 @@ import (
 
 var diagnostics *tview.TextView
 
-// JSON-RPC request structure
+// Request JSON-RPC request structure
 type Request[T any] struct {
 	JsonRPC string `json:"jsonrpc"`
 	ID      int    `json:"id"`
@@ -125,6 +125,8 @@ func main() {
 			//log.Println("File saved!") // Replace with actual save logic
 		case tcell.KeyCtrlQ: // Exit app
 			app.Stop()
+		default:
+
 		}
 		return event // Pass the key event back to the editor
 	})
@@ -134,7 +136,6 @@ func main() {
 	go func() {
 		defer logf("Stopped listening to gopls")
 		listenToGopls(stdout, diagnostics)
-		cmd.Wait()
 		logf("gopls state %s", cmd.ProcessState.String())
 	}()
 
@@ -298,7 +299,10 @@ func listenToGopls(stdout io.ReadCloser, diagnostics *tview.TextView) {
 				break
 			}
 			if strings.HasPrefix(line, "Content-Length:") {
-				fmt.Sscanf(line, "Content-Length: %d", &contentLength)
+				_, err := fmt.Sscanf(line, "Content-Length: %d", &contentLength)
+				if err != nil {
+					panic(err)
+				}
 				break
 			}
 		} else {
