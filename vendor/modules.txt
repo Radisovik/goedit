@@ -47,9 +47,6 @@ github.com/lucasb-eyer/go-colorful
 # github.com/mattn/go-runewidth v0.0.16
 ## explicit; go 1.9
 github.com/mattn/go-runewidth
-# github.com/rivo/tview v0.0.0-20241227133733-17b7edb88c57
-## explicit; go 1.18
-github.com/rivo/tview
 # github.com/rivo/uniseg v0.4.7
 ## explicit; go 1.18
 github.com/rivo/uniseg

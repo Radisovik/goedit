@@ -4,7 +4,6 @@ go 1.23.5
 
 require (
 	github.com/gdamore/tcell/v2 v2.8.1
-	github.com/rivo/tview v0.0.0-20241227133733-17b7edb88c57
 	github.com/sourcegraph/go-lsp v0.0.0-20240223163137-f80c5dd31dfd
 	golang.org/x/term v0.29.0
 )
