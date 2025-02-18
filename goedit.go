@@ -11,15 +11,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
-
-//var app *tview.Application
-///var diagnostics *tview.TextView
 
 var logfile *os.File
 var logOpen sync.Once
@@ -38,7 +36,7 @@ var MENU_ENABLED_STYLE = tcell.Style{}.Foreground(tcell.ColorWhite).Background(C
 var MENU_DISABLED_STYLE = tcell.Style{}.Foreground(tcell.ColorDarkGray).Background(tcell.ColorBlack)
 var FILE_TAB_STYLE = tcell.Style{}.Foreground(tcell.ColorYellow).Background(tcell.ColorBlack)
 var currentFile = ""
-var menuEnabled = "no"
+var menuState = "disabled"
 var LINE_NUMBERS_WIDTH = 4
 
 // Request JSON-RPC request structure
@@ -60,9 +58,71 @@ var logLines = [NUM_LOG_LINES]string{}
 
 var files = make(map[string]*TextDocument)
 
+type ViewArea struct {
+	// absolute coordinates
+	x, y, w, h     int
+	scrollable     bool
+	multiline      bool
+	editable       bool
+	content        *TextDocument
+	dirty          bool
+	topVisibleLine int
+	focus          bool
+}
+
+func (a *ViewArea) render() {
+	if a != nil && a.dirty && a.content != nil {
+		x := a.x
+		y := a.y
+		l := 0
+		for _, line := range a.content.lines {
+			pos := 0
+			for _, r := range line {
+				screen.SetContent(x, y, r, nil, a.content.style[l][pos])
+				x++
+			}
+			y++
+		}
+	}
+}
+
+func (t *TextDocument) growDocument(line, pos int) {
+	stringPad := strings.Repeat(" ", pos)
+	for {
+		if line >= len(t.lines) {
+			t.lines = append(t.lines, stringPad)
+		} else {
+			break
+		}
+	}
+}
+
+func (t *TextDocument) set(line, pos int, r string, style tcell.Style) {
+	t.growDocument(line, pos)
+	t.lines[line] = insert(t.lines[line], pos, r)
+
+	t.style = slices.Grow(t.style, line+1)
+	stylePadding := make([]tcell.Style, len(r))
+	for i := 0; i < len(r); i++ {
+		stylePadding[i] = style
+	}
+	t.style[pos] = slices.Insert(t.style[pos], pos, stylePadding...)
+}
+
+func insert(src string, pos int, toInsert string) string {
+	if pos > len(src) {
+		// If the position is out of bounds, pad the string with spaces up to the position
+		padding := make([]rune, pos-len(src))
+		src += string(padding)
+	}
+	// Insert the string in the desired position
+	return src[:pos] + toInsert + src[pos:]
+}
+
 type TextDocument struct {
 	name     string
-	lines    [][]CharCell
+	lines    []string
+	style    [][]tcell.Style
 	lastUsed time.Time
 }
 
@@ -70,13 +130,6 @@ type CharCell struct {
 	rune  rune
 	style tcell.Style
 }
-
-type viewport_type struct {
-	filepath string
-	line     int
-}
-
-var viewPort = viewport_type{}
 
 func logf(format string, args ...interface{}) {
 	logOpen.Do(func() {
@@ -118,6 +171,19 @@ func logf(format string, args ...interface{}) {
 
 var cx = 0
 var cy = 0
+
+var logArea *ViewArea
+var editorArea *ViewArea
+var menuArea *ViewArea
+var tabsArea *ViewArea
+
+func render() {
+	logArea.render()
+	editorArea.render()
+	menuArea.render()
+	tabsArea.render()
+	screen.Show()
+}
 
 func main() {
 
@@ -193,10 +259,12 @@ func main() {
 	defer quit()
 
 	// Event loop
+	loadFiles()
 	inited := false
 	for {
-		// Update screen
-		screen.Show()
+		// update the tcell buffer from our text documents
+		// and tell tcell to redraw
+		render()
 
 		// Poll event
 		ev := screen.PollEvent()
@@ -205,22 +273,13 @@ func main() {
 		switch ev := ev.(type) {
 		case *tcell.EventResize:
 			if !inited {
-				initLsp(stdin)
+				setupAreas()
+				drawFileTabs()
 				inited = true
-				enableMenu(false)
 			}
 			screen.Sync()
-			_, height := ev.Size()
-			ln := 1
-			for r := 2; r < height-NUM_LOG_LINES; r++ {
-				drawText(0, r, LINE_NUMBERS_STYLE, "%d", ln)
-				ln++
-			}
-			loadFiles()
-			//	loadFile("testdata/testprogram.go")
-			drawFile(0, "testdata/testprogram.go")
 		case *tcell.EventKey:
-			if menuEnabled != "no" {
+			if menuState == "enabled" {
 				if ev.Rune() == 'Q' || ev.Rune() == 'q' {
 					screen.Clear()
 					return
@@ -239,6 +298,7 @@ func main() {
 			} else {
 				if ev.Key() == tcell.KeyEscape {
 					enableMenu(true)
+
 				} else if ev.Key() == tcell.KeyCtrlC {
 					screen.Clear()
 					return
@@ -254,7 +314,7 @@ func main() {
 					moveCursor(0, 1)
 				} else if ev.Key() == tcell.KeyCtrlS {
 					// Request formatting
-					if err := sendFormattingRequest(stdin, "TextDocument://"+currentFile); err != nil {
+					if err := sendFormattingRequest(stdin, "file://"+currentFile); err != nil {
 						logf("Error sending formatting request: %v", err)
 					}
 				} else {
@@ -272,55 +332,12 @@ func main() {
 					} else {
 						// Insert the new rune at the current cursor position and shift others to the right
 						if ev.Key() == 127 {
-							f := files[currentFile]
-							line := f.lines[cy]
-							newLine := make([]CharCell, 0)
-							i := 0
-							for {
-								if i == cx-1 {
-									break
-								}
-								newLine = append(newLine, line[i])
-								i++
-							}
-							i++
-							for {
-								if i == len(line)-1 {
-									break
-								}
-								newLine = append(newLine, line[i])
-								i++
-							}
-							f.lines[cy] = newLine
-							drawLine(cy)
-							moveCursor(-1, 0) // Move the cursor to the right after inserting
+
 						} else {
 							newRune := ev.Rune()
 							if newRune != 0 { // Ensure it's a valid rune
-								f := files[currentFile]
-								line := f.lines[cy]
-
-								// Insert the rune at the cursor position
-								newLine := make([]CharCell, 0)
-								i := 0
-								for {
-									if i == cx {
-										break
-									}
-									newLine = append(newLine, line[i])
-									i++
-								}
-								newLine = append(newLine, CharCell{rune: newRune, style: CODE_DEFAULT_STYLE})
-								for {
-									if i == len(line) {
-										break
-									}
-									newLine = append(newLine, line[i])
-									i++
-								}
-								f.lines[cy] = newLine
-								drawLine(cy)
-								moveCursor(1, 0) // Move the cursor to the right after inserting
+								editorArea.content.set(cy, cx, string(newRune), CODE_DEFAULT_STYLE)
+								moveCursor(0, 0) // Move the cursor to the right after inserting
 							}
 							// Print the key code
 							logf("Key: %v", ev.Key())
@@ -348,8 +365,80 @@ func main() {
 	}
 }
 
-func loadFiles() {
+func enableMenu(enabled bool) {
+	if !enabled {
+		menuArea.FillStyle(MENU_DISABLED_STYLE)
+		menuState = "disabled"
+	} else {
+		menuArea.FillStyle(MENU_ENABLED_STYLE)
+		menuState = "enabled"
+	}
+}
 
+func NewWideLineThing(x, y int, s tcell.Style, content string) *ViewArea {
+	sw, _ := screen.Size()
+	txt := &TextDocument{
+		name:     "",
+		lastUsed: time.Time{},
+	}
+	txt.set(0, 0, content, s)
+	v := &ViewArea{
+		x:          x,
+		y:          y,
+		w:          sw,
+		h:          1,
+		scrollable: false,
+		multiline:  false,
+		editable:   false,
+		content:    txt,
+	}
+	v.dirty = true
+	return v
+}
+
+func setupAreas() {
+	width, height := screen.Size()
+	editorArea = &ViewArea{
+		x:          0,
+		y:          2,
+		w:          width,
+		h:          height,
+		scrollable: true,
+		multiline:  true,
+		editable:   true,
+		content:    nil,
+	}
+	logArea = &ViewArea{
+		x:         0,
+		y:         height - 5,
+		w:         width,
+		h:         5,
+		multiline: true,
+	}
+	menuArea = NewWideLineThing(0, 0, MENU_DISABLED_STYLE, "Q) Quit L) Refresh T) Tools R) Refactor S) Search")
+	tabsArea = NewWideLineThing(0, 0, FILE_TAB_STYLE, "File Tabs")
+}
+
+func (va *ViewArea) placeText(line int, pos int, msg string, style tcell.Style) {
+	va.dirty = true
+	if va.content == nil {
+		va.content = &TextDocument{}
+	}
+	va.content.set(line, pos, msg, style)
+}
+
+func (a *ViewArea) FillStyle(style tcell.Style) {
+	if a.content != nil {
+		for i := range a.content.style {
+			for j := range a.content.style[i] {
+				a.content.style[i][j] = style
+			}
+		}
+		a.dirty = true
+	}
+}
+
+func loadFiles() {
 	cwd, err := os.Getwd()
 	poe(err)
 
@@ -361,39 +450,18 @@ func loadFiles() {
 		if !info.IsDir() && strings.HasSuffix(path, ".go") && !strings.Contains(path, "vendor") {
 			// Construct the relative path from the current working directory to the TextDocument
 			relPath, err := filepath.Rel(cwd, path)
-			poe(err)          // Handle any potential error while determining the relative path
+			poe(err) // Handle any potential error while determining the relative path
+
 			loadFile(relPath) // Use the relative path instead of the absolute one
 		}
 		return nil
 	})
+
 	poe(err)
-
-}
-
-func drawLine(row int) {
-	f := files[currentFile]
-	i := 0
-	line := f.lines[row]
-	for {
-		if i == len(line) {
-			break
-		}
-		cell := line[i]
-		screen.SetContent(i+LINE_NUMBERS_WIDTH, row+EDITOR_LINE, cell.rune, nil, cell.style)
-		i++
-	}
-	w, _ := screen.Size()
-	for {
-		if i+LINE_NUMBERS_WIDTH >= w {
-			break
-		}
-		screen.SetContent(i+LINE_NUMBERS_WIDTH, row+EDITOR_LINE, ' ', nil, CODE_DEFAULT_STYLE)
-		i++
-	}
-	screen.Show()
 }
 
 func moveCursor(dx, dy int) {
+	return
 	width, height := screen.Size()
 	f := files[currentFile]
 	nx := cx + dx
@@ -423,8 +491,8 @@ func moveCursor(dx, dy int) {
 
 	msg := ""
 	for i := 0; i < 5 && i < len(line); i++ {
-		cell := line[i]
-		msg += string(cell.rune)
+		//	cell := line[i]
+		//msg += string(cell.rune)
 	}
 	drawText(60, 0, CODE_DEFAULT_STYLE, "%10s", msg)
 	//if cx >= len(line) {
@@ -436,16 +504,6 @@ func moveCursor(dx, dy int) {
 	}
 	drawText(50, 0, CODE_DEFAULT_STYLE, "(%3d,%3d)", cx, cy)
 	screen.ShowCursor(x, y)
-}
-
-func enableMenu(b bool) {
-	if b {
-		drawText(0, MENU_LINE, MENU_ENABLED_STYLE, "Q) Quit L) Refresh T) Tools R) Refactor S) Search")
-		menuEnabled = "yes"
-	} else {
-		drawText(0, MENU_LINE, MENU_DISABLED_STYLE, "Q) Quit L) Refresh T) Tools R) Refactor S) Search")
-		menuEnabled = "no"
-	}
 }
 
 func drawText(x, y int, style tcell.Style, format string, args ...any) {
@@ -460,26 +518,20 @@ func loadFile(filePath string) {
 	content, err := os.ReadFile(filePath)
 	poe(err)
 	f := &TextDocument{
-		name:  filePath,
-		lines: [][]CharCell{},
+		name: filePath,
 	}
 
 	scanner := bufio.NewScanner(bytes.NewReader(content))
+	lineNumber := 0
 	for scanner.Scan() {
 		line := scanner.Text()
-		var lineBuffer []CharCell
-		for _, r := range line {
-			lineBuffer = append(lineBuffer, CharCell{rune: r, style: CODE_DEFAULT_STYLE})
-		}
-		f.lines = append(f.lines, lineBuffer)
+		f.set(lineNumber, 0, line, CODE_DEFAULT_STYLE)
+		lineNumber++
 	}
-
 	if err := scanner.Err(); err != nil {
 		poe(err) // Handle any potential scanning errors
 	}
 	files[filePath] = f
-	drawFileTabs()
-
 }
 
 func drawFileTabs() {
@@ -500,7 +552,7 @@ func drawFileTabs() {
 			style = style.Reverse(true)
 		}
 		msg := fmt.Sprintf("%d) %-15s ", i+1, name[:min(len(name), 15)])
-		drawText(cx, FILE_TABS_LINE, style, msg)
+		tabsArea.placeText(0, cx, msg, style)
 		cx += 20
 	}
 
@@ -525,12 +577,12 @@ func drawFile(line int, filePath string) {
 	for i := line; i < len(f.lines) && (startLine+i) < endLine; i++ {
 		var lineContent string
 		for _, cell := range f.lines[i] {
-			lineContent += string(cell.rune)
+			lineContent += string(cell)
 		}
 		drawText(LINE_NUMBERS_WIDTH, startLine+i, CODE_DEFAULT_STYLE, "%s", lineContent)
 	}
 	f.lastUsed = time.Now()
-	drawFileTabs()
+
 	screen.SetTitle(filePath)
 	moveCursor(0, 0)
 }
@@ -585,7 +637,7 @@ func sendInitializationRequest(stdin io.Writer) (Response[lsp.InitializeResult],
 	if err != nil {
 		return Response[lsp.InitializeResult]{}, fmt.Errorf("failed to get current working directory: %v", err)
 	}
-	testdataURI := lsp.DocumentURI("TextDocument://" + filepath.Join(cwd, "testdata"))
+	testdataURI := lsp.DocumentURI("file://" + filepath.Join(cwd, "testdata"))
 
 	p := lsp.InitializeParams{
 		RootURI:      testdataURI,
@@ -661,7 +713,7 @@ func send[R any](stdin io.Writer, request Request[R]) error {
 
 func sendSyntax(stdin io.Writer) (Response[lsp.SemanticHighlightingTokens], error) {
 	r := lsp.TextDocumentIdentifier{
-		URI: lsp.DocumentURI("TextDocument://" + currentFile),
+		URI: lsp.DocumentURI("file://" + currentFile),
 	}
 	rq := req[lsp.TextDocumentIdentifier]("textDocument/semanticTokens/full", r)
 	return sendSync[lsp.TextDocumentIdentifier, lsp.SemanticHighlightingTokens](stdin, rq)
@@ -681,7 +733,7 @@ func sendDidOpen(stdinWriter io.Writer, filePath string) (rslt Response[NULL_PAR
 		return
 	}
 
-	uri := lsp.DocumentURI("TextDocument://" + absPath)
+	uri := lsp.DocumentURI("file://" + absPath)
 	request := Request[lsp.DidOpenTextDocumentParams]{
 		JsonRPC: "2.0",
 		ID:      2,
@@ -872,7 +924,7 @@ func sendCompletionRequest(stdin io.Writer, line, character int) (Response[Compl
 		panic(err)
 	}
 
-	uri := lsp.DocumentURI("TextDocument://" + absPath)
+	uri := lsp.DocumentURI("file://" + absPath)
 
 	r := lsp.CompletionParams{
 		TextDocumentPositionParams: lsp.TextDocumentPositionParams{
