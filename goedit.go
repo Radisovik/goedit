@@ -57,33 +57,6 @@ var logLines = [NUM_LOG_LINES]string{}
 
 var files = make(map[string]editors.Editor)
 
-type ViewArea struct {
-	// absolute coordinates
-	x, y, w, h     int
-	scrollable     bool
-	multiline      bool
-	editable       bool
-	content        editors.Editor
-	dirty          bool
-	topVisibleLine int
-	focus          bool
-}
-
-func (va *ViewArea) render() {
-	if va != nil && va.dirty && va.content != nil {
-		x := va.x
-		y := va.y
-		for ln := 0; ln < va.content.Length(); ln++ {
-			line, styles := va.content.GetLine(ln)
-			for pos, r := range line {
-				screen.SetContent(x, y, r, nil, styles[pos])
-				x++
-			}
-			y++
-		}
-	}
-}
-
 func logf(format string, args ...interface{}) {
 	logOpen.Do(func() {
 		var err error
@@ -132,11 +105,16 @@ var tabsArea *ViewArea
 
 func render() {
 	logArea.render()
+	if debugNow {
+		debugNow = false
+	}
 	editorArea.render()
 	menuArea.render()
 	tabsArea.render()
 	screen.Show()
 }
+
+var debugNow = false
 
 func main() {
 
@@ -290,6 +268,8 @@ func main() {
 							newRune := ev.Rune()
 							if newRune != 0 { // Ensure it's a valid rune
 								editorArea.content.InsertChar(cy, cx, newRune, CODE_DEFAULT_STYLE)
+								editorArea.dirty = true
+								debugNow = true
 								moveCursor(0, 0) // Move the cursor to the right after inserting
 							}
 							// Print the key code
@@ -373,31 +353,6 @@ func setupAreas() {
 	}
 	menuArea = NewWideLineThing(0, 0, MENU_DISABLED_STYLE, "Q)uit T)ools R)efactor S)earch")
 	tabsArea = NewWideLineThing(0, 1, FILE_TAB_STYLE, "File Tabs")
-}
-
-func (va *ViewArea) placeText(line int, pos int, msg string, style tcell.Style) {
-	va.dirty = true
-	if va.content == nil {
-		va.content = NewEditor()
-	}
-	va.content.InsertText(line, pos, msg, style)
-}
-
-func (va *ViewArea) FillStyle(style tcell.Style) {
-	if va.content != nil {
-		currentLine := va.topVisibleLine
-		totalLines := va.content.Length()
-		for {
-			if currentLine >= totalLines {
-				break
-			}
-			line, _ := va.content.GetLine(currentLine)
-			length := len(line)
-			va.content.ApplyStyle(currentLine, 0, length, style)
-			currentLine++
-		}
-		va.dirty = true
-	}
 }
 
 func loadFiles() {
@@ -941,4 +896,56 @@ func sendFormattingRequest(stdin io.Writer, uri string) error {
 type Position struct {
 	Line   int
 	Column int
+}
+
+type ViewArea struct {
+	// absolute coordinates
+	x, y, w, h     int
+	scrollable     bool
+	multiline      bool
+	editable       bool
+	content        editors.Editor
+	dirty          bool
+	topVisibleLine int
+	focus          bool
+}
+
+func (va *ViewArea) render() {
+	if va != nil && va.dirty && va.content != nil {
+		x := va.x
+		y := va.y
+		for ln := 0; ln < va.content.Length(); ln++ {
+			line, styles := va.content.GetLine(ln)
+			for pos, r := range line {
+				screen.SetContent(x, y, r, nil, styles[pos])
+				x++
+			}
+			y++
+		}
+	}
+}
+
+func (va *ViewArea) placeText(line int, pos int, msg string, style tcell.Style) {
+	va.dirty = true
+	if va.content == nil {
+		va.content = NewEditor()
+	}
+	va.content.InsertText(line, pos, msg, style)
+}
+
+func (va *ViewArea) FillStyle(style tcell.Style) {
+	if va.content != nil {
+		currentLine := va.topVisibleLine
+		totalLines := va.content.Length()
+		for {
+			if currentLine >= totalLines {
+				break
+			}
+			line, _ := va.content.GetLine(currentLine)
+			length := len(line)
+			va.content.ApplyStyle(currentLine, 0, length, style)
+			currentLine++
+		}
+		va.dirty = true
+	}
 }
