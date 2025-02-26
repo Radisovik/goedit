@@ -5,14 +5,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/Radisovik/goedit/editors"
 	"github.com/gdamore/tcell/v2"
 	"github.com/sourcegraph/go-lsp"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,7 +55,7 @@ type Response[T any] struct {
 var screen tcell.Screen
 var logLines = [NUM_LOG_LINES]string{}
 
-var files = make(map[string]*TextDocument)
+var files = make(map[string]editors.Editor)
 
 type ViewArea struct {
 	// absolute coordinates
@@ -64,71 +63,25 @@ type ViewArea struct {
 	scrollable     bool
 	multiline      bool
 	editable       bool
-	content        *TextDocument
+	content        editors.Editor
 	dirty          bool
 	topVisibleLine int
 	focus          bool
 }
 
-func (a *ViewArea) render() {
-	if a != nil && a.dirty && a.content != nil {
-		x := a.x
-		y := a.y
-		l := 0
-		for _, line := range a.content.lines {
-			pos := 0
-			for _, r := range line {
-				screen.SetContent(x, y, r, nil, a.content.style[l][pos])
+func (va *ViewArea) render() {
+	if va != nil && va.dirty && va.content != nil {
+		x := va.x
+		y := va.y
+		for ln := 0; ln < va.content.Length(); ln++ {
+			line, styles := va.content.GetLine(ln)
+			for pos, r := range line {
+				screen.SetContent(x, y, r, nil, styles[pos])
 				x++
 			}
 			y++
 		}
 	}
-}
-
-func (t *TextDocument) growDocument(line, pos int) {
-	stringPad := strings.Repeat(" ", pos)
-	for {
-		if line >= len(t.lines) {
-			t.lines = append(t.lines, stringPad)
-		} else {
-			break
-		}
-	}
-}
-
-func (t *TextDocument) set(line, pos int, r string, style tcell.Style) {
-	t.growDocument(line, pos)
-	t.lines[line] = insert(t.lines[line], pos, r)
-
-	t.style = slices.Grow(t.style, line+1)
-	stylePadding := make([]tcell.Style, len(r))
-	for i := 0; i < len(r); i++ {
-		stylePadding[i] = style
-	}
-	t.style[pos] = slices.Insert(t.style[pos], pos, stylePadding...)
-}
-
-func insert(src string, pos int, toInsert string) string {
-	if pos > len(src) {
-		// If the position is out of bounds, pad the string with spaces up to the position
-		padding := make([]rune, pos-len(src))
-		src += string(padding)
-	}
-	// Insert the string in the desired position
-	return src[:pos] + toInsert + src[pos:]
-}
-
-type TextDocument struct {
-	name     string
-	lines    []string
-	style    [][]tcell.Style
-	lastUsed time.Time
-}
-
-type CharCell struct {
-	rune  rune
-	style tcell.Style
 }
 
 func logf(format string, args ...interface{}) {
@@ -336,7 +289,7 @@ func main() {
 						} else {
 							newRune := ev.Rune()
 							if newRune != 0 { // Ensure it's a valid rune
-								editorArea.content.set(cy, cx, string(newRune), CODE_DEFAULT_STYLE)
+								editorArea.content.InsertChar(cy, cx, newRune, CODE_DEFAULT_STYLE)
 								moveCursor(0, 0) // Move the cursor to the right after inserting
 							}
 							// Print the key code
@@ -377,11 +330,8 @@ func enableMenu(enabled bool) {
 
 func NewWideLineThing(x, y int, s tcell.Style, content string) *ViewArea {
 	sw, _ := screen.Size()
-	txt := &TextDocument{
-		name:     "",
-		lastUsed: time.Time{},
-	}
-	txt.set(0, 0, content, s)
+	txt := NewEditor()
+
 	v := &ViewArea{
 		x:          x,
 		y:          y,
@@ -392,8 +342,13 @@ func NewWideLineThing(x, y int, s tcell.Style, content string) *ViewArea {
 		editable:   false,
 		content:    txt,
 	}
+	v.placeText(0, 0, content, s)
 	v.dirty = true
 	return v
+}
+
+func NewEditor() editors.Editor {
+	return &editors.DirtSimpleEditor{}
 }
 
 func setupAreas() {
@@ -406,7 +361,7 @@ func setupAreas() {
 		scrollable: true,
 		multiline:  true,
 		editable:   true,
-		content:    nil,
+		content:    NewEditor(),
 	}
 	logArea = &ViewArea{
 		x:         0,
@@ -414,27 +369,34 @@ func setupAreas() {
 		w:         width,
 		h:         5,
 		multiline: true,
+		content:   NewEditor(),
 	}
-	menuArea = NewWideLineThing(0, 0, MENU_DISABLED_STYLE, "Q) Quit L) Refresh T) Tools R) Refactor S) Search")
-	tabsArea = NewWideLineThing(0, 0, FILE_TAB_STYLE, "File Tabs")
+	menuArea = NewWideLineThing(0, 0, MENU_DISABLED_STYLE, "Q)uit T)ools R)efactor S)earch")
+	tabsArea = NewWideLineThing(0, 1, FILE_TAB_STYLE, "File Tabs")
 }
 
 func (va *ViewArea) placeText(line int, pos int, msg string, style tcell.Style) {
 	va.dirty = true
 	if va.content == nil {
-		va.content = &TextDocument{}
+		va.content = NewEditor()
 	}
-	va.content.set(line, pos, msg, style)
+	va.content.InsertText(line, pos, msg, style)
 }
 
-func (a *ViewArea) FillStyle(style tcell.Style) {
-	if a.content != nil {
-		for i := range a.content.style {
-			for j := range a.content.style[i] {
-				a.content.style[i][j] = style
+func (va *ViewArea) FillStyle(style tcell.Style) {
+	if va.content != nil {
+		currentLine := va.topVisibleLine
+		totalLines := va.content.Length()
+		for {
+			if currentLine >= totalLines {
+				break
 			}
+			line, _ := va.content.GetLine(currentLine)
+			length := len(line)
+			va.content.ApplyStyle(currentLine, 0, length, style)
+			currentLine++
 		}
-		a.dirty = true
+		va.dirty = true
 	}
 }
 
@@ -461,49 +423,49 @@ func loadFiles() {
 }
 
 func moveCursor(dx, dy int) {
-	return
-	width, height := screen.Size()
-	f := files[currentFile]
-	nx := cx + dx
-	ny := cy + dy
-	if ny >= len(f.lines) || ny < 0 {
-		logf("Invalid cursor YY position: %d, %d", nx, ny)
-		return
-	}
-	line := f.lines[ny]
-	if nx < 0 {
-		logf("Invalid cursor XX position: %d, %d %s", nx, ny, line)
-		return
-	}
-	if nx >= len(line) {
-		nx = len(line)
-	}
-
-	x := nx + LINE_NUMBERS_WIDTH
-	y := ny + EDITOR_LINE
-	if x >= width || y >= height-NUM_LOG_LINES {
-		logf("Invalid cursor XX,YY position: %d, %d %s", x, y, line)
-		return
-	}
-
-	cx = nx
-	cy = ny
-
-	msg := ""
-	for i := 0; i < 5 && i < len(line); i++ {
-		//	cell := line[i]
-		//msg += string(cell.rune)
-	}
-	drawText(60, 0, CODE_DEFAULT_STYLE, "%10s", msg)
-	//if cx >= len(line) {
-	//	cx = len(line) - 1
-	//	x = cx + LINE_NUMBERS_WIDTH
+	//return
+	//width, height := screen.Size()
+	//f := files[currentFile]
+	//nx := cx + dx
+	//ny := cy + dy
+	//if ny >= len(f.lines) || ny < 0 {
+	//	logf("Invalid cursor YY position: %d, %d", nx, ny)
+	//	return
 	//}
-	if cx < 0 || cy < 0 {
-		poe(fmt.Errorf("invalid cursor position: %d, %d", cx, cy))
-	}
-	drawText(50, 0, CODE_DEFAULT_STYLE, "(%3d,%3d)", cx, cy)
-	screen.ShowCursor(x, y)
+	//line := f.lines[ny]
+	//if nx < 0 {
+	//	logf("Invalid cursor XX position: %d, %d %s", nx, ny, line)
+	//	return
+	//}
+	//if nx >= len(line) {
+	//	nx = len(line)
+	//}
+	//
+	//x := nx + LINE_NUMBERS_WIDTH
+	//y := ny + EDITOR_LINE
+	//if x >= width || y >= height-NUM_LOG_LINES {
+	//	logf("Invalid cursor XX,YY position: %d, %d %s", x, y, line)
+	//	return
+	//}
+	//
+	//cx = nx
+	//cy = ny
+	//
+	//msg := ""
+	//for i := 0; i < 5 && i < len(line); i++ {
+	//	//	cell := line[i]
+	//	//msg += string(cell.rune)
+	//}
+	//drawText(60, 0, CODE_DEFAULT_STYLE, "%10s", msg)
+	////if cx >= len(line) {
+	////	cx = len(line) - 1
+	////	x = cx + LINE_NUMBERS_WIDTH
+	////}
+	//if cx < 0 || cy < 0 {
+	//	poe(fmt.Errorf("invalid cursor position: %d, %d", cx, cy))
+	//}
+	//drawText(50, 0, CODE_DEFAULT_STYLE, "(%3d,%3d)", cx, cy)
+	//screen.ShowCursor(x, y)
 }
 
 func drawText(x, y int, style tcell.Style, format string, args ...any) {
@@ -517,15 +479,13 @@ func loadFile(filePath string) {
 	// Read TextDocument content
 	content, err := os.ReadFile(filePath)
 	poe(err)
-	f := &TextDocument{
-		name: filePath,
-	}
+	f := NewEditor()
 
 	scanner := bufio.NewScanner(bytes.NewReader(content))
 	lineNumber := 0
 	for scanner.Scan() {
 		line := scanner.Text()
-		f.set(lineNumber, 0, line, CODE_DEFAULT_STYLE)
+		f.InsertLine(lineNumber, line)
 		lineNumber++
 	}
 	if err := scanner.Err(); err != nil {
@@ -540,11 +500,6 @@ func drawFileTabs() {
 		sortedNames = append(sortedNames, name)
 	}
 
-	// Sort sortedNames by the lastUsed field of the corresponding value in the files map
-	sort.Slice(sortedNames, func(i, j int) bool {
-		return files[sortedNames[i]].lastUsed.Before(files[sortedNames[j]].lastUsed)
-	})
-
 	cx := 0
 	for i, name := range sortedNames {
 		style := FILE_TAB_STYLE
@@ -558,34 +513,34 @@ func drawFileTabs() {
 
 }
 
-func drawFile(line int, filePath string) {
-
-	f, ok := files[filePath]
-	if !ok {
-		logf("File not found: %s", filePath)
-		return
-	}
-
-	currentFile = filePath
-
-	// Calculate the drawing range
-	_, screenHeight := screen.Size()
-	startLine := EDITOR_LINE
-	endLine := screenHeight - NUM_LOG_LINES
-
-	// Walk the internal buffer of the TextDocument and draw text line by line
-	for i := line; i < len(f.lines) && (startLine+i) < endLine; i++ {
-		var lineContent string
-		for _, cell := range f.lines[i] {
-			lineContent += string(cell)
-		}
-		drawText(LINE_NUMBERS_WIDTH, startLine+i, CODE_DEFAULT_STYLE, "%s", lineContent)
-	}
-	f.lastUsed = time.Now()
-
-	screen.SetTitle(filePath)
-	moveCursor(0, 0)
-}
+//
+//func drawFile(line int, filePath string) {
+//
+//	f, ok := files[filePath]
+//	if !ok {
+//		logf("File not found: %s", filePath)
+//		return
+//	}
+//
+//	currentFile = filePath
+//
+//	// Calculate the drawing range
+//	_, screenHeight := screen.Size()
+//	startLine := EDITOR_LINE
+//	endLine := screenHeight - NUM_LOG_LINES
+//
+//	// Walk the internal buffer of the TextDocument and draw text line by line
+//	for i := line; i < len(f.lines) && (startLine+i) < endLine; i++ {
+//		var lineContent string
+//		for _, cell := range f.lines[i] {
+//			lineContent += string(cell)
+//		}
+//		drawText(LINE_NUMBERS_WIDTH, startLine+i, CODE_DEFAULT_STYLE, "%s", lineContent)
+//	}
+//
+//	screen.SetTitle(filePath)
+//	moveCursor(0, 0)
+//}
 
 func poe(err error) {
 	if err != nil {
