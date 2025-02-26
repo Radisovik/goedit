@@ -378,49 +378,48 @@ func loadFiles() {
 }
 
 func moveCursor(dx, dy int) {
-	//return
-	//width, height := screen.Size()
-	//f := files[currentFile]
-	//nx := cx + dx
-	//ny := cy + dy
-	//if ny >= len(f.lines) || ny < 0 {
-	//	logf("Invalid cursor YY position: %d, %d", nx, ny)
-	//	return
+	width, height := screen.Size()
+	f := editorArea.content
+	nx := cx + dx
+	ny := cy + dy
+	if ny >= f.Length() || ny < 0 {
+		logf("Invalid cursor YY position: %d, %d", nx, ny)
+		return
+	}
+	line, _ := f.GetLine(dy)
+	if nx < 0 {
+		logf("Invalid cursor XX position: %d, %d %+v", nx, ny, line)
+		return
+	}
+	if nx >= len(line) {
+		nx = len(line)
+	}
+
+	x := nx + LINE_NUMBERS_WIDTH
+	y := ny + EDITOR_LINE
+	if x >= width || y >= height-NUM_LOG_LINES {
+		logf("Invalid cursor XX,YY position: %d, %d %+v", x, y, line)
+		return
+	}
+
+	cx = nx
+	cy = ny
+
+	msg := ""
+	for i := 0; i < 5 && i < len(line); i++ {
+		//	cell := line[i]
+		//msg += string(cell.rune)
+	}
+	drawText(60, 0, CODE_DEFAULT_STYLE, "%10s", msg)
+	//if cx >= len(line) {
+	//	cx = len(line) - 1
+	//	x = cx + LINE_NUMBERS_WIDTH
 	//}
-	//line := f.lines[ny]
-	//if nx < 0 {
-	//	logf("Invalid cursor XX position: %d, %d %s", nx, ny, line)
-	//	return
-	//}
-	//if nx >= len(line) {
-	//	nx = len(line)
-	//}
-	//
-	//x := nx + LINE_NUMBERS_WIDTH
-	//y := ny + EDITOR_LINE
-	//if x >= width || y >= height-NUM_LOG_LINES {
-	//	logf("Invalid cursor XX,YY position: %d, %d %s", x, y, line)
-	//	return
-	//}
-	//
-	//cx = nx
-	//cy = ny
-	//
-	//msg := ""
-	//for i := 0; i < 5 && i < len(line); i++ {
-	//	//	cell := line[i]
-	//	//msg += string(cell.rune)
-	//}
-	//drawText(60, 0, CODE_DEFAULT_STYLE, "%10s", msg)
-	////if cx >= len(line) {
-	////	cx = len(line) - 1
-	////	x = cx + LINE_NUMBERS_WIDTH
-	////}
-	//if cx < 0 || cy < 0 {
-	//	poe(fmt.Errorf("invalid cursor position: %d, %d", cx, cy))
-	//}
-	//drawText(50, 0, CODE_DEFAULT_STYLE, "(%3d,%3d)", cx, cy)
-	//screen.ShowCursor(x, y)
+	if cx < 0 || cy < 0 {
+		poe(fmt.Errorf("invalid cursor position: %d, %d", cx, cy))
+	}
+	drawText(50, 0, CODE_DEFAULT_STYLE, "(%3d,%3d)", cx, cy)
+	screen.ShowCursor(x, y)
 }
 
 func drawText(x, y int, style tcell.Style, format string, args ...any) {
