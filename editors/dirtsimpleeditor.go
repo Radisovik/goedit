@@ -31,6 +31,19 @@ func (d *DirtSimpleEditor) InsertText(line int, pos int, msg string, style tcell
 	d.InsertLine(line, msg, style)
 }
 
+func (d *DirtSimpleEditor) SetLine(line int, text string, style ...tcell.Style) {
+
+	if line < 0 {
+		panic("line index out of range")
+	} else if line >= len(d.lines) {
+		d.InsertLine(line, text, style...)
+		return
+	}
+	styledLine := makeStyledLine(style, text)
+	d.lines[line] = styledLine
+
+}
+
 // InsertLine  insert a line of text into the editor, shifting lines that are below that down
 // and if a style is provided we should apply that style to the characters of the text
 func (d *DirtSimpleEditor) InsertLine(line int, text string, style ...tcell.Style) {
@@ -38,10 +51,26 @@ func (d *DirtSimpleEditor) InsertLine(line int, text string, style ...tcell.Styl
 		panic("line index out of range")
 	}
 
+	styledLine := makeStyledLine(style, text)
+
+	d.lines = slices.Insert(d.lines, line, styledLine)
+}
+
+func makeStyledLine(style []tcell.Style, text string) StyledLine {
 	// Prepare the StyledLine
 	var styledLine StyledLine
-	if len(style) > 0 {
+	if len(style) > 1 {
 		// Apply the provided style to each character in the text
+		idx := 0
+		for _, char := range text {
+			styledLine = append(styledLine, StyledChar{
+				Char:  char,
+				Style: style[idx],
+			})
+			idx++
+		}
+	} else if len(style) == 1 {
+		// Use default style if none is provided
 		for _, char := range text {
 			styledLine = append(styledLine, StyledChar{
 				Char:  char,
@@ -57,41 +86,7 @@ func (d *DirtSimpleEditor) InsertLine(line int, text string, style ...tcell.Styl
 			})
 		}
 	}
-
-	d.lines = slices.Insert(d.lines, line, styledLine)
-	//
-	//// Create a new slice that is 1 bigger
-	//newLines := make([]StyledLine, len(d.lines)+1)
-	//
-	//if line == len(d.lines) {
-	//	copy(newLines, d.lines)
-	//	newLines[line] = styledLine
-	//} else if line == 0 {
-	//	copy(newLines[1:], d.lines)
-	//	newLines[0] = styledLine
-	//} else {
-	//
-	//	idx := 0
-	//	for {
-	//		if idx == line {
-	//			break
-	//		}
-	//		newLines[idx] = d.lines[idx]
-	//		idx++
-	//	}
-	//	newLines[line] = styledLine
-	//
-	//	for {
-	//		if idx == len(newLines) {
-	//			break
-	//		}
-	//		newLines[idx+1] = d.lines[idx]
-	//	}
-	//
-	//}
-	//
-	//// Replace the original lines with the newLines
-	//d.lines = newLines
+	return styledLine
 }
 
 func (d *DirtSimpleEditor) GetLine(line int) ([]rune, []tcell.Style) {
@@ -113,8 +108,7 @@ func (d *DirtSimpleEditor) InsertChar(line int, column int, text rune, style tce
 	runes, styles := d.GetLine(line)
 	runes = slices.Insert(runes, column, text)
 	styles = slices.Insert(styles, column, style)
-	d.DeleteLine(line)
-	d.InsertLine(line, string(runes), styles...)
+	d.SetLine(line, string(runes), styles...)
 }
 
 // DeleteLine remove the line of text, along with the styles, shifting lines and styles up

@@ -29,14 +29,13 @@ const EDITOR_LINE = 2
 const ColorFaintGrey = tcell.ColorIsRGB | tcell.ColorValid | 0x323232
 
 var LINE_NUMBERS_STYLE = tcell.Style{}.Foreground(tcell.ColorDarkGray)
-var CODE_DEFAULT_STYLE = tcell.Style{}.Foreground(tcell.ColorWhite).Background(tcell.ColorBlack)
+var CODE_DEFAULT_STYLE = tcell.Style{}.Foreground(tcell.ColorGreen).Background(tcell.ColorGrey)
 var LOG_DEFAULT_STYLE = tcell.Style{}.Foreground(tcell.ColorLightSteelBlue).Background(tcell.ColorBlack)
 var MENU_ENABLED_STYLE = tcell.Style{}.Foreground(tcell.ColorWhite).Background(ColorFaintGrey)
 var MENU_DISABLED_STYLE = tcell.Style{}.Foreground(tcell.ColorDarkGray).Background(tcell.ColorBlack)
 var FILE_TAB_STYLE = tcell.Style{}.Foreground(tcell.ColorYellow).Background(tcell.ColorBlack)
 var currentFile = ""
 var menuState = "disabled"
-var LINE_NUMBERS_WIDTH = 4
 
 // Request JSON-RPC request structure
 type Request[T any] struct {
@@ -173,7 +172,8 @@ func main() {
 	screen.SetStyle(defStyle)
 
 	screen.SetCursorStyle(tcell.CursorStyleBlinkingBar)
-	screen.ShowCursor(cx+LINE_NUMBERS_WIDTH, cy+EDITOR_LINE)
+
+	//screen.ShowCursor(cx+6, cy+EDITOR_LINE)
 	// Clear screen
 	screen.Clear()
 
@@ -267,10 +267,10 @@ func main() {
 						} else {
 							newRune := ev.Rune()
 							if newRune != 0 { // Ensure it's a valid rune
-								editorArea.content.InsertChar(cy, cx, newRune, CODE_DEFAULT_STYLE)
+								moveCursor(1, 0) // Move the cursor to the right after inserting
+								editorArea.InsertChar(cy, cx, newRune, CODE_DEFAULT_STYLE)
 								editorArea.dirty = true
 								debugNow = true
-								moveCursor(0, 0) // Move the cursor to the right after inserting
 							}
 							// Print the key code
 							logf("Key: %v", ev.Key())
@@ -313,14 +313,15 @@ func NewWideLineThing(x, y int, s tcell.Style, content string) *ViewArea {
 	txt := NewEditor()
 
 	v := &ViewArea{
-		x:          x,
-		y:          y,
-		w:          sw,
-		h:          1,
-		scrollable: false,
-		multiline:  false,
-		editable:   false,
-		content:    txt,
+		x:               x,
+		y:               y,
+		w:               sw,
+		h:               1,
+		scrollable:      false,
+		multiline:       false,
+		editable:        false,
+		content:         txt,
+		showLineNumbers: false,
 	}
 	v.placeText(0, 0, content, s)
 	v.dirty = true
@@ -343,6 +344,7 @@ func setupAreas() {
 		editable:   true,
 		content:    NewEditor(),
 	}
+	editorArea.showLineNumbers = true
 	logArea = &ViewArea{
 		x:         0,
 		y:         height - 5,
@@ -395,8 +397,8 @@ func moveCursor(dx, dy int) {
 		nx = len(line)
 	}
 
-	x := nx + LINE_NUMBERS_WIDTH
-	y := ny + EDITOR_LINE
+	x := nx
+	y := ny
 	if x >= width || y >= height-NUM_LOG_LINES {
 		logf("Invalid cursor XX,YY position: %d, %d %+v", x, y, line)
 		return
@@ -419,7 +421,7 @@ func moveCursor(dx, dy int) {
 		poe(fmt.Errorf("invalid cursor position: %d, %d", cx, cy))
 	}
 	drawText(50, 0, CODE_DEFAULT_STYLE, "(%3d,%3d)", cx, cy)
-	screen.ShowCursor(x, y)
+	screen.ShowCursor(x+7, y+EDITOR_LINE)
 }
 
 func drawText(x, y int, style tcell.Style, format string, args ...any) {
@@ -899,22 +901,32 @@ type Position struct {
 
 type ViewArea struct {
 	// absolute coordinates
-	x, y, w, h     int
-	scrollable     bool
-	multiline      bool
-	editable       bool
-	content        editors.Editor
-	dirty          bool
-	topVisibleLine int
-	focus          bool
+	x, y, w, h      int
+	scrollable      bool
+	multiline       bool
+	editable        bool
+	content         editors.Editor
+	dirty           bool
+	topVisibleLine  int
+	focus           bool
+	showLineNumbers bool
 }
 
 func (va *ViewArea) render() {
-	if va != nil && va.dirty && va.content != nil {
-		x := va.x
+	if va != nil && va.content != nil {
 		y := va.y
 		for ln := 0; ln < va.content.Length(); ln++ {
+			x := va.x
+
 			line, styles := va.content.GetLine(ln)
+			if va.showLineNumbers {
+				ls := fmt.Sprintf("%4d:", ln+1)
+				for _, r := range ls {
+					screen.SetContent(x, y, r, nil, LINE_NUMBERS_STYLE)
+					x++
+				}
+			}
+			x++
 			for pos, r := range line {
 				screen.SetContent(x, y, r, nil, styles[pos])
 				x++
@@ -947,4 +959,9 @@ func (va *ViewArea) FillStyle(style tcell.Style) {
 		}
 		va.dirty = true
 	}
+}
+
+func (va *ViewArea) InsertChar(line int, col int, newRune rune, style tcell.Style) {
+	logf("inserting char %c at %d,%d with style %+v", newRune, line, col+va.x, style)
+	va.content.InsertChar(line, col+va.x, newRune, style)
 }
