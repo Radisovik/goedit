@@ -104,11 +104,22 @@ func (d *DirtSimpleEditor) GetLine(line int) ([]rune, []tcell.Style) {
 	return runes, styles
 }
 
+// InsertChar inserts a character at a specified position in the text editor.
+// If the character is '\n', it splits the current line into two, with the part
+// before the cursor remaining on the current line and the part after the cursor
+// moved to a new line below.  Returns true if the line needs to be 100% redrawn
 func (d *DirtSimpleEditor) InsertChar(line int, column int, text rune, style tcell.Style) {
-	runes, styles := d.GetLine(line)
-	runes = slices.Insert(runes, column, text)
-	styles = slices.Insert(styles, column, style)
-	d.SetLine(line, string(runes), styles...)
+	if text == '\n' {
+		sl := d.lines[line]
+		d.lines[line] = sl[:column]                           // trim the current line to only hold the before \n
+		d.lines = slices.Insert(d.lines, line+1, sl[column:]) // and the stuff after the cursor goes on the next line
+		//	log.Printf("line: %d, column: %d, text: %s, style: %s\n", line, column, text, style)
+	} else {
+		runes, styles := d.GetLine(line)
+		runes = slices.Insert(runes, column, text)
+		styles = slices.Insert(styles, column, style)
+		d.SetLine(line, string(runes), styles...)
+	}
 }
 
 // DeleteLine remove the line of text, along with the styles, shifting lines and styles up

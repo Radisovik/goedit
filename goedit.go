@@ -242,7 +242,8 @@ func main() {
 				} else if ev.Key() == tcell.KeyRight {
 					moveCursor(1, 0)
 				} else if ev.Key() == tcell.KeyEnter {
-					moveCursor(0, 1)
+					editorArea.InsertChar(cy, cx, '\n', CODE_DEFAULT_STYLE)
+					setCursor(0, cy+1)
 				} else if ev.Key() == tcell.KeyCtrlS {
 					// Request formatting
 					if err := sendFormattingRequest(stdin, "file://"+currentFile); err != nil {
@@ -259,6 +260,7 @@ func main() {
 								poe(err)
 								logf("%s %s %s", v.Label, v.Detail, marshal)
 							}
+
 						}
 					} else {
 						// Insert the new rune at the current cursor position and shift others to the right
@@ -269,8 +271,6 @@ func main() {
 							if newRune != 0 { // Ensure it's a valid rune
 								moveCursor(1, 0) // Move the cursor to the right after inserting
 								editorArea.InsertChar(cy, cx, newRune, CODE_DEFAULT_STYLE)
-								editorArea.dirty = true
-								debugNow = true
 							}
 							// Print the key code
 							logf("Key: %v", ev.Key())
@@ -324,7 +324,6 @@ func NewWideLineThing(x, y int, s tcell.Style, content string) *ViewArea {
 		showLineNumbers: false,
 	}
 	v.placeText(0, 0, content, s)
-	v.dirty = true
 	return v
 }
 
@@ -379,6 +378,16 @@ func loadFiles() {
 	poe(err)
 }
 
+func setCursor(ax, ay int) {
+	if cx < 0 {
+		logf("Invalid cursor position: %d, %d", cx, cy)
+		return
+	}
+	cx = ax
+	cy = ay
+	screen.ShowCursor(cx+7, cy+EDITOR_LINE)
+}
+
 func moveCursor(dx, dy int) {
 	width, height := screen.Size()
 	f := editorArea.content
@@ -388,13 +397,13 @@ func moveCursor(dx, dy int) {
 		logf("Invalid cursor YY position: %d, %d", nx, ny)
 		return
 	}
-	line, _ := f.GetLine(dy)
+	line, _ := f.GetLine(ny)
 	if nx < 0 {
 		logf("Invalid cursor XX position: %d, %d %+v", nx, ny, line)
 		return
 	}
 	if nx >= len(line) {
-		nx = len(line)
+		nx = len(line) - 1
 	}
 
 	x := nx
@@ -407,12 +416,6 @@ func moveCursor(dx, dy int) {
 	cx = nx
 	cy = ny
 
-	msg := ""
-	for i := 0; i < 5 && i < len(line); i++ {
-		//	cell := line[i]
-		//msg += string(cell.rune)
-	}
-	drawText(60, 0, CODE_DEFAULT_STYLE, "%10s", msg)
 	//if cx >= len(line) {
 	//	cx = len(line) - 1
 	//	x = cx + LINE_NUMBERS_WIDTH
@@ -421,6 +424,7 @@ func moveCursor(dx, dy int) {
 		poe(fmt.Errorf("invalid cursor position: %d, %d", cx, cy))
 	}
 	drawText(50, 0, CODE_DEFAULT_STYLE, "(%3d,%3d)", cx, cy)
+	//	screen.HideCursor()
 	screen.ShowCursor(x+7, y+EDITOR_LINE)
 }
 
@@ -468,35 +472,6 @@ func drawFileTabs() {
 	}
 
 }
-
-//
-//func drawFile(line int, filePath string) {
-//
-//	f, ok := files[filePath]
-//	if !ok {
-//		logf("File not found: %s", filePath)
-//		return
-//	}
-//
-//	currentFile = filePath
-//
-//	// Calculate the drawing range
-//	_, screenHeight := screen.Size()
-//	startLine := EDITOR_LINE
-//	endLine := screenHeight - NUM_LOG_LINES
-//
-//	// Walk the internal buffer of the TextDocument and draw text line by line
-//	for i := line; i < len(f.lines) && (startLine+i) < endLine; i++ {
-//		var lineContent string
-//		for _, cell := range f.lines[i] {
-//			lineContent += string(cell)
-//		}
-//		drawText(LINE_NUMBERS_WIDTH, startLine+i, CODE_DEFAULT_STYLE, "%s", lineContent)
-//	}
-//
-//	screen.SetTitle(filePath)
-//	moveCursor(0, 0)
-//}
 
 func poe(err error) {
 	if err != nil {
@@ -906,7 +881,6 @@ type ViewArea struct {
 	multiline       bool
 	editable        bool
 	content         editors.Editor
-	dirty           bool
 	topVisibleLine  int
 	focus           bool
 	showLineNumbers bool
@@ -931,13 +905,17 @@ func (va *ViewArea) render() {
 				screen.SetContent(x, y, r, nil, styles[pos])
 				x++
 			}
+			for x < va.w {
+				screen.SetContent(x, y, ' ', nil, CODE_DEFAULT_STYLE)
+				x++
+			}
+
 			y++
 		}
 	}
 }
 
 func (va *ViewArea) placeText(line int, pos int, msg string, style tcell.Style) {
-	va.dirty = true
 	if va.content == nil {
 		va.content = NewEditor()
 	}
@@ -957,11 +935,12 @@ func (va *ViewArea) FillStyle(style tcell.Style) {
 			va.content.ApplyStyle(currentLine, 0, length, style)
 			currentLine++
 		}
-		va.dirty = true
 	}
 }
 
 func (va *ViewArea) InsertChar(line int, col int, newRune rune, style tcell.Style) {
 	logf("inserting char %c at %d,%d with style %+v", newRune, line, col+va.x, style)
-	va.content.InsertChar(line, col+va.x, newRune, style)
+	if va.content.InsertChar(line, col+va.x, newRune, style) {
+
+	}
 }
