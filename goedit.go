@@ -272,8 +272,6 @@ func main() {
 								moveCursor(1, 0) // Move the cursor to the right after inserting
 								editorArea.InsertChar(cy, cx, newRune, CODE_DEFAULT_STYLE)
 							}
-							// Print the key code
-							logf("Key: %v", ev.Key())
 						}
 
 					}
@@ -940,7 +938,5 @@ func (va *ViewArea) FillStyle(style tcell.Style) {
 
 func (va *ViewArea) InsertChar(line int, col int, newRune rune, style tcell.Style) {
 	logf("inserting char %c at %d,%d with style %+v", newRune, line, col+va.x, style)
-	if va.content.InsertChar(line, col+va.x, newRune, style) {
-
-	}
+	va.content.InsertChar(line, col+va.x, newRune, style)
 }
